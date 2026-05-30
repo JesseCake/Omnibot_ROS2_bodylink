@@ -1,23 +1,45 @@
 // omnibot_drive.ino
 // Differential drive controller for Omnibot
 // Pico (RP2040) + TB6612 + AS5600 magnetic encoders
-// Ready for micro-ROS cmd_vel / odom integration
+// micro-ROS Jazzy over USB Serial
 //
-// Serial tuning commands:
-//   p2.5     set KP to 2.5
-//   i0.3     set KI to 0.3
-//   d0.0     set KD to 0.0
-//   t75      set target speed to 75 mm/s (both wheels forward)
-//   w25      set PWM slew limit to 25
-//   m30      set PWM minimum (dead zone) to 30
-//   a0.7     set EWMA speed filter alpha to 0.7
-//   x255     set PWM maximum to 255
-//   s        stop
-//   r        reset odometry
-//   ?        print all current parameters
+// ROS2 interface:
+//   Subscribes: /cmd_vel (geometry_msgs/Twist)
+//   Publishes:  /odom    (nav_msgs/Odometry)
+//   Parameters: kp, ki, kd, pwm_max, pwm_min, pwm_slew, speed_alpha
+//
+// Serial tuning (only active when micro-ROS agent is NOT connected):
+//   p i d t w m a x s r ?
+//
+// EEPROM: all tunable params saved to flash on change
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <EEPROM.h>
+
+// ─────────────────────────────────────────────
+//  micro-ROS includes
+// ─────────────────────────────────────────────
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <rclc_parameter/rclc_parameter.h>
+#include <rmw_microros/rmw_microros.h>
+
+#include <nav_msgs/msg/odometry.h>
+#include <geometry_msgs/msg/twist.h>
+
+// ─────────────────────────────────────────────
+//  Atomic stub — required by micro-ROS on RP2040
+// ─────────────────────────────────────────────
+extern "C" bool __atomic_test_and_set(volatile void *ptr, int memorder) {
+  volatile uint8_t *p = (volatile uint8_t *)ptr;
+  bool old = *p;
+  *p = 1;
+  return old;
+}
 
 // ─────────────────────────────────────────────
 //  Hardware pins  (TB6612 + Pico GPIO)
@@ -32,14 +54,11 @@ constexpr int BIN2  = 7;
 
 constexpr int STBY  = 8;
 
-constexpr int I2C0_SDA = 20, I2C0_SCL = 21;  // Left encoder
-constexpr int I2C1_SDA = 18, I2C1_SCL = 19;  // Right encoder
+constexpr int I2C0_SDA = 20, I2C0_SCL = 21;
+constexpr int I2C1_SDA = 18, I2C1_SCL = 19;
 
-// Motor direction flip — set true if motor runs backwards for positive target
-constexpr bool LEFT_FLIP  = false;
-constexpr bool RIGHT_FLIP = false;
-
-// Encoder direction flip — set true if encoder reads negative when wheel goes forward
+constexpr bool LEFT_FLIP      = false;
+constexpr bool RIGHT_FLIP     = false;
 constexpr bool LEFT_ENC_FLIP  = true;
 constexpr bool RIGHT_ENC_FLIP = false;
 
@@ -52,20 +71,82 @@ constexpr float COUNTS_PER_REV = 4096.0f;
 constexpr float TRACK_MM       = 170.0f;
 
 // ─────────────────────────────────────────────
-//  Control tunables — ALL runtime-adjustable via serial
+//  EEPROM layout
+//  Simple struct at address 0, prefixed with magic
+//  to detect uninitialised flash
 // ─────────────────────────────────────────────
-float gKP          = 5.0f;
-float gKI          = 1.5f;
-float gKD          = 0.0f;
-float gTarget_mm_s = 0.0f;
+constexpr uint32_t EEPROM_MAGIC = 0xDEAD0042;
+constexpr int      EEPROM_SIZE  = 256;
 
-float gPwmMax      = 255.0f;
-float gPwmMin      = 30.0f;
-float gPwmSlew     = 15.0f;
-float gSpeedAlpha  = 0.7f;
+struct SavedParams {
+  uint32_t magic;
+  float kp;
+  float ki;
+  float kd;
+  float pwmMax;
+  float pwmMin;
+  float pwmSlew;
+  float speedAlpha;
+};
+
+// ─────────────────────────────────────────────
+//  Runtime tunable params
+// ─────────────────────────────────────────────
+float gKP         = 5.0f;
+float gKI         = 1.5f;
+float gKD         = 0.0f;
+float gPwmMax     = 255.0f;
+float gPwmMin     = 30.0f;
+float gPwmSlew    = 15.0f;
+float gSpeedAlpha = 0.7f;
+
+float gTarget_mm_s = 0.0f;
 
 constexpr uint32_t CTRL_PERIOD_MS  = 20;
 constexpr uint32_t PRINT_PERIOD_MS = 100;
+
+// ─────────────────────────────────────────────
+//  EEPROM helpers
+// ─────────────────────────────────────────────
+void eepromLoad() {
+  EEPROM.begin(EEPROM_SIZE);
+  SavedParams p;
+  EEPROM.get(0, p);
+  if (p.magic == EEPROM_MAGIC) {
+    gKP         = p.kp;
+    gKI         = p.ki;
+    gKD         = p.kd;
+    gPwmMax     = p.pwmMax;
+    gPwmMin     = p.pwmMin;
+    gPwmSlew    = p.pwmSlew;
+    gSpeedAlpha = p.speedAlpha;
+    Serial.println("Params loaded from flash.");
+  } else {
+    Serial.println("No saved params, using defaults.");
+  }
+}
+
+void eepromSave() {
+  SavedParams p;
+  p.magic      = EEPROM_MAGIC;
+  p.kp         = gKP;
+  p.ki         = gKI;
+  p.kd         = gKD;
+  p.pwmMax     = gPwmMax;
+  p.pwmMin     = gPwmMin;
+  p.pwmSlew    = gPwmSlew;
+  p.speedAlpha = gSpeedAlpha;
+
+  // Only write if changed — earlephilhower EEPROM.put does
+  // byte-level comparison so won't burn flash unnecessarily
+  SavedParams existing;
+  EEPROM.get(0, existing);
+  if (memcmp(&p, &existing, sizeof(p)) != 0) {
+    EEPROM.put(0, p);
+    EEPROM.commit();
+    Serial.println("Params saved to flash.");
+  }
+}
 
 // ─────────────────────────────────────────────
 //  AS5600 helpers
@@ -217,6 +298,11 @@ struct Odom {
 Wheel left  = { &Wire,  { AIN1, AIN2, PWMA }, LEFT_FLIP,  LEFT_ENC_FLIP,  .pid = { gKP, gKI, gKD } };
 Wheel right = { &Wire1, { BIN1, BIN2, PWMB }, RIGHT_FLIP, RIGHT_ENC_FLIP, .pid = { gKP, gKI, gKD } };
 
+void applyGains() {
+  left.pid.setGains(gKP, gKI, gKD);
+  right.pid.setGains(gKP, gKI, gKD);
+}
+
 void setTargetsFromTwist(float vx_m_s, float wz_rad_s) {
   float b = TRACK_MM * 0.001f;
   left.target_mm_s  = (vx_m_s - 0.5f * wz_rad_s * b) * 1000.0f;
@@ -224,10 +310,178 @@ void setTargetsFromTwist(float vx_m_s, float wz_rad_s) {
   gTarget_mm_s = vx_m_s * 1000.0f;
 }
 
-void applyGains() {
-  left.pid.setGains(gKP, gKI, gKD);
-  right.pid.setGains(gKP, gKI, gKD);
+// ─────────────────────────────────────────────
+//  micro-ROS state
+// ─────────────────────────────────────────────
+enum class AgentState { WAITING, CONNECTED, ERROR };
+AgentState agentState = AgentState::WAITING;
+
+rcl_node_t            node;
+rclc_support_t        support;
+rcl_allocator_t       allocator;
+rclc_executor_t       executor;
+
+rcl_publisher_t       odom_pub;
+rcl_subscription_t    cmd_vel_sub;
+rclc_parameter_server_t param_server;
+
+nav_msgs__msg__Odometry        odom_msg;
+geometry_msgs__msg__Twist      cmd_vel_msg;
+
+// Timestamp helpers
+rcl_clock_t ros_clock;
+
+// ─────────────────────────────────────────────
+//  micro-ROS callbacks
+// ─────────────────────────────────────────────
+void cmdVelCallback(const void *msg) {
+  const geometry_msgs__msg__Twist *twist =
+    (const geometry_msgs__msg__Twist *)msg;
+  setTargetsFromTwist(twist->linear.x, twist->angular.z);
 }
+
+bool paramCallback(const Parameter *old_param, const Parameter *new_param, void *context) {
+  (void)old_param; (void)context;
+
+  bool changed = false;
+
+  if (strcmp(new_param->name.data, "kp") == 0) {
+    gKP = new_param->value.double_value;
+    changed = true;
+  } else if (strcmp(new_param->name.data, "ki") == 0) {
+    gKI = new_param->value.double_value;
+    changed = true;
+  } else if (strcmp(new_param->name.data, "kd") == 0) {
+    gKD = new_param->value.double_value;
+    changed = true;
+  } else if (strcmp(new_param->name.data, "pwm_max") == 0) {
+    gPwmMax = constrain((float)new_param->value.double_value, 50.0f, 255.0f);
+    changed = true;
+  } else if (strcmp(new_param->name.data, "pwm_min") == 0) {
+    gPwmMin = constrain((float)new_param->value.double_value, 0.0f, 100.0f);
+    changed = true;
+  } else if (strcmp(new_param->name.data, "pwm_slew") == 0) {
+    gPwmSlew = constrain((float)new_param->value.double_value, 1.0f, 255.0f);
+    changed = true;
+  } else if (strcmp(new_param->name.data, "speed_alpha") == 0) {
+    gSpeedAlpha = constrain((float)new_param->value.double_value, 0.0f, 0.99f);
+    changed = true;
+  }
+
+  if (changed) {
+    applyGains();
+    eepromSave();
+  }
+
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  micro-ROS init / cleanup
+// ─────────────────────────────────────────────
+#define RCCHECK(fn) { rcl_ret_t rc = fn; if (rc != RCL_RET_OK) { return false; } }
+
+bool microRosInit() {
+  allocator = rcl_get_default_allocator();
+
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  RCCHECK(rclc_node_init_default(&node, "omnibot_drive", "", &support));
+
+  // Publisher: /odom
+  RCCHECK(rclc_publisher_init_default(
+    &odom_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    "odom"));
+
+  // Subscriber: /cmd_vel
+  RCCHECK(rclc_subscription_init_default(
+    &cmd_vel_sub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+    "cmd_vel"));
+
+  // Parameter server
+  const rclc_parameter_options_t param_opts = {
+    .notify_changed_over_dds        = true,
+    .max_params                     = 7,
+    .allow_undeclared_parameters    = false,
+    .low_mem_mode                   = false
+  };
+  RCCHECK(rclc_parameter_server_init_with_option(&param_server, &node, &param_opts));
+
+  // Executor: cmd_vel + param server handles
+  // param server needs RCLC_PARAMETER_EXECUTOR_HANDLES_NUMBER handles
+  RCCHECK(rclc_executor_init(&executor, &support.context,
+    1 + RCLC_EXECUTOR_PARAMETER_SERVER_HANDLES, &allocator));
+
+  RCCHECK(rclc_executor_add_subscription(
+    &executor, &cmd_vel_sub, &cmd_vel_msg, &cmdVelCallback, ON_NEW_DATA));
+
+  RCCHECK(rclc_executor_add_parameter_server(
+    &executor, &param_server, paramCallback));
+
+  // Declare parameters with current values
+  RCCHECK(rclc_add_parameter(&param_server, "kp",          RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "ki",          RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "kd",          RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "pwm_max",     RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "pwm_min",     RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "pwm_slew",    RCLC_PARAMETER_DOUBLE));
+  RCCHECK(rclc_add_parameter(&param_server, "speed_alpha", RCLC_PARAMETER_DOUBLE));
+
+  RCCHECK(rclc_parameter_set_double(&param_server, "kp",          gKP));
+  RCCHECK(rclc_parameter_set_double(&param_server, "ki",          gKI));
+  RCCHECK(rclc_parameter_set_double(&param_server, "kd",          gKD));
+  RCCHECK(rclc_parameter_set_double(&param_server, "pwm_max",     gPwmMax));
+  RCCHECK(rclc_parameter_set_double(&param_server, "pwm_min",     gPwmMin));
+  RCCHECK(rclc_parameter_set_double(&param_server, "pwm_slew",    gPwmSlew));
+  RCCHECK(rclc_parameter_set_double(&param_server, "speed_alpha", gSpeedAlpha));
+
+  // Clock for odom timestamps
+  RCCHECK(rcl_clock_init(RCL_STEADY_TIME, &ros_clock, &allocator));
+
+  return true;
+}
+
+void microRosCleanup() {
+  rcl_publisher_fini(&odom_pub, &node);
+  rcl_subscription_fini(&cmd_vel_sub, &node);
+  rclc_parameter_server_fini(&param_server, &node);
+  rclc_executor_fini(&executor);
+  rcl_node_fini(&node);
+  rclc_support_fini(&support);
+  rcl_clock_fini(&ros_clock);
+}
+
+void publishOdom() {
+  // Timestamp
+  rcl_time_point_value_t now;
+  rcl_clock_get_now(&ros_clock, &now);
+  odom_msg.header.stamp.sec     = (int32_t)(now / 1000000000ULL);
+  odom_msg.header.stamp.nanosec = (uint32_t)(now % 1000000000ULL);
+
+  // Frame IDs — set once in setup, no need to repeat
+  odom_msg.pose.pose.position.x = odom.x;
+  odom_msg.pose.pose.position.y = odom.y;
+  odom_msg.pose.pose.position.z = 0.0;
+
+  // Quaternion from yaw
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sinf(odom.th * 0.5f);
+  odom_msg.pose.pose.orientation.w = cosf(odom.th * 0.5f);
+
+  odom_msg.twist.twist.linear.x  = odom.vx;
+  odom_msg.twist.twist.linear.y  = 0.0;
+  odom_msg.twist.twist.angular.z = odom.wz;
+
+  rcl_publish(&odom_pub, &odom_msg, NULL);
+}
+
+// ─────────────────────────────────────────────
+//  Serial tuning (fallback when agent not connected)
+// ─────────────────────────────────────────────
+String serialBuf = "";
 
 void printParams() {
   Serial.println("--- Current parameters ---");
@@ -243,12 +497,10 @@ void printParams() {
   Serial.println("--------------------------");
 }
 
-// ─────────────────────────────────────────────
-//  Serial command parser
-// ─────────────────────────────────────────────
-String serialBuf = "";
-
 void handleSerial() {
+  // Only process serial tuning when micro-ROS agent is not connected
+  if (agentState == AgentState::CONNECTED) return;
+
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
@@ -257,40 +509,20 @@ void handleSerial() {
 
       char cmd = tolower(serialBuf[0]);
       float val = serialBuf.substring(1).toFloat();
+      bool changed = false;
 
       switch (cmd) {
-        case 'p':
-          gKP = val; applyGains();
-          Serial.print("KP -> "); Serial.println(gKP, 3);
-          break;
-        case 'i':
-          gKI = val; applyGains();
-          Serial.print("KI -> "); Serial.println(gKI, 3);
-          break;
-        case 'd':
-          gKD = val; applyGains();
-          Serial.print("KD -> "); Serial.println(gKD, 3);
-          break;
+        case 'p': gKP = val;                                            changed = true; Serial.print("KP -> ");        Serial.println(gKP, 3);        break;
+        case 'i': gKI = val;                                            changed = true; Serial.print("KI -> ");        Serial.println(gKI, 3);        break;
+        case 'd': gKD = val;                                            changed = true; Serial.print("KD -> ");        Serial.println(gKD, 3);        break;
+        case 'w': gPwmSlew    = constrain(val, 1.0f,   255.0f);        changed = true; Serial.print("pwmSlew -> ");   Serial.println(gPwmSlew, 0);   break;
+        case 'm': gPwmMin     = constrain(val, 0.0f,   100.0f);        changed = true; Serial.print("pwmMin -> ");    Serial.println(gPwmMin, 0);    break;
+        case 'a': gSpeedAlpha = constrain(val, 0.0f,   0.99f);         changed = true; Serial.print("alpha -> ");     Serial.println(gSpeedAlpha, 2); break;
+        case 'x': gPwmMax     = constrain(val, 50.0f,  255.0f);        changed = true; Serial.print("pwmMax -> ");    Serial.println(gPwmMax, 0);    break;
         case 't':
           gTarget_mm_s = val;
           setTargetsFromTwist(val * 0.001f, 0.0f);
           Serial.print("target -> "); Serial.print(gTarget_mm_s, 1); Serial.println(" mm/s");
-          break;
-        case 'w':
-          gPwmSlew = constrain(val, 1.0f, 255.0f);
-          Serial.print("pwmSlew -> "); Serial.println(gPwmSlew, 0);
-          break;
-        case 'm':
-          gPwmMin = constrain(val, 0.0f, 100.0f);
-          Serial.print("pwmMin -> "); Serial.println(gPwmMin, 0);
-          break;
-        case 'a':
-          gSpeedAlpha = constrain(val, 0.0f, 0.99f);
-          Serial.print("alpha -> "); Serial.println(gSpeedAlpha, 2);
-          break;
-        case 'x':
-          gPwmMax = constrain(val, 50.0f, 255.0f);
-          Serial.print("pwmMax -> "); Serial.println(gPwmMax, 0);
           break;
         case 's':
           gTarget_mm_s = 0.0f;
@@ -308,6 +540,12 @@ void handleSerial() {
           Serial.print("unknown: "); Serial.println(serialBuf);
           break;
       }
+
+      if (changed) {
+        applyGains();
+        eepromSave();
+      }
+
       serialBuf = "";
     } else {
       serialBuf += c;
@@ -316,36 +554,14 @@ void handleSerial() {
 }
 
 // ─────────────────────────────────────────────
-//  micro-ROS stubs  (fill in next stage)
-// ─────────────────────────────────────────────
-// #include <micro_ros_arduino.h>
-// #include <nav_msgs/msg/odometry.h>
-// #include <geometry_msgs/msg/twist.h>
-// rcl_publisher_t odom_pub; rcl_subscription_t cmd_vel_sub;
-// rclc_executor_t executor; rclc_support_t support;
-// rcl_allocator_t allocator; rcl_node_t node;
-//
-// void cmd_vel_callback(const void *msg) {
-//   const geometry_msgs__msg__Twist *t = (const geometry_msgs__msg__Twist *)msg;
-//   setTargetsFromTwist(t->linear.x, t->angular.z);
-// }
-// void publishOdom() {
-//   nav_msgs__msg__Odometry msg = {0};
-//   msg.pose.pose.position.x    = odom.x;
-//   msg.pose.pose.position.y    = odom.y;
-//   msg.pose.pose.orientation.z = sinf(odom.th * 0.5f);
-//   msg.pose.pose.orientation.w = cosf(odom.th * 0.5f);
-//   msg.twist.twist.linear.x    = odom.vx;
-//   msg.twist.twist.angular.z   = odom.wz;
-//   rcl_publish(&odom_pub, &msg, NULL);
-// }
-
-// ─────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000) delay(10);
+
+  // Load params from flash before anything else
+  eepromLoad();
 
   for (int p : { AIN1, AIN2, PWMA, BIN1, BIN2, PWMB, STBY })
     pinMode(p, OUTPUT);
@@ -358,27 +574,69 @@ void setup() {
   Wire.setSDA(I2C0_SDA);  Wire.setSCL(I2C0_SCL);  Wire.setClock(400000);  Wire.begin();
   Wire1.setSDA(I2C1_SDA); Wire1.setSCL(I2C1_SCL); Wire1.setClock(400000); Wire1.begin();
 
+  applyGains();
+
+  // Set up micro-ROS transport (USB serial)
+  set_microros_serial_transports(Serial);
+
+  // Initialise odom message header strings
+  odom_msg.header.frame_id.data     = (char*)"odom";
+  odom_msg.header.frame_id.size     = 4;
+  odom_msg.header.frame_id.capacity = 5;
+  odom_msg.child_frame_id.data      = (char*)"base_link";
+  odom_msg.child_frame_id.size      = 9;
+  odom_msg.child_frame_id.capacity  = 10;
+
   Serial.println("Omnibot drive ready.");
-  Serial.println("Commands: p i d t w m a x s r ?");
-  Serial.println("  p=KP  i=KI  d=KD  t=target(mm/s)");
-  Serial.println("  w=pwmSlew  m=pwmMin  a=alpha  x=pwmMax");
-  Serial.println("  s=stop  r=reset odom  ?=all params");
+  Serial.println("Waiting for micro-ROS agent...");
   Serial.println();
   printParams();
-  Serial.println();
-  Serial.println("ms       | tgt    spdL   errL   intL   pwmL  | spdR   errR   intR   pwmR  | odom_x  odom_y  odom_th");
-  Serial.println("---------+--------------------------------------+--------------------------------------+---------------------------");
 }
 
 // ─────────────────────────────────────────────
 //  Loop
 // ─────────────────────────────────────────────
 void loop() {
-  static uint32_t lastTick  = millis();
-  static uint32_t lastPrint = millis();
+  static uint32_t lastTick      = millis();
+  static uint32_t lastAgentPing = millis();
 
   uint32_t now = millis();
 
+  // ── micro-ROS agent state machine ──
+  // Try to connect every 500ms while waiting
+  // Detect disconnection and reconnect gracefully
+  if (now - lastAgentPing >= 500) {
+    lastAgentPing = now;
+
+    switch (agentState) {
+      case AgentState::WAITING:
+        if (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) {
+          if (microRosInit()) {
+            agentState = AgentState::CONNECTED;
+            Serial.println("[micro-ROS] Agent connected.");
+          } else {
+            agentState = AgentState::ERROR;
+          }
+        }
+        break;
+
+      case AgentState::CONNECTED:
+        if (RMW_RET_OK != rmw_uros_ping_agent(100, 1)) {
+          microRosCleanup();
+          agentState = AgentState::WAITING;
+          left.stop(); right.stop();
+          Serial.println("[micro-ROS] Agent disconnected. Waiting...");
+        }
+        break;
+
+      case AgentState::ERROR:
+        microRosCleanup();
+        agentState = AgentState::WAITING;
+        break;
+    }
+  }
+
+  // ── Control tick ──
   if (now - lastTick >= CTRL_PERIOD_MS) {
     float dt = (now - lastTick) * 0.001f;
     lastTick = now;
@@ -391,29 +649,11 @@ void loop() {
     right.update(dt);
     odom.integrate(left.dsMM, right.dsMM, dt);
 
-    // rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
-    // publishOdom();
-  }
-
-  if (now - lastPrint >= PRINT_PERIOD_MS) {
-    lastPrint = now;
-
-    static int lineCount = 0;
-    if (++lineCount % 30 == 0) {
-      Serial.println();
-      Serial.println("ms       | tgt    spdL   errL   intL   pwmL  | spdR   errR   intR   pwmR  | odom_x  odom_y  odom_th");
-      Serial.println("---------+--------------------------------------+--------------------------------------+---------------------------");
+    if (agentState == AgentState::CONNECTED) {
+      publishOdom();
+      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
     }
-
-    char buf[120];
-    snprintf(buf, sizeof(buf),
-      "%8lu | %6.1f %6.1f %6.1f %6.2f %5d | %6.1f %6.1f %6.2f %5d | %7.3f  %7.3f  %7.3f",
-      now,
-      left.target_mm_s,
-      left.speedFilt,    left.pid.lastErr,  left.pid.integral,  left.lastPwm,
-      right.speedFilt,   right.pid.lastErr, right.pid.integral, right.lastPwm,
-      odom.x, odom.y, odom.th
-    );
-    Serial.println(buf);
   }
+
+  
 }
