@@ -558,6 +558,46 @@ void handleSerial() {
 }
 
 // ─────────────────────────────────────────────
+//  This is for refining and testing the motor 
+//  direction and encoder feedback for direction tuning etc
+// ─────────────────────────────────────────────
+//#define TEST_MODE
+
+void testLoop() {
+  static uint32_t lastTick = millis();
+  static uint32_t lastPrint = millis();
+  
+  // Set a fixed forward target
+  left.target_mm_s  = 100.0f;  // 100mm/s forward
+  right.target_mm_s = 100.0f;
+
+  uint32_t now = millis();
+  
+  if (now - lastTick >= CTRL_PERIOD_MS) {
+    float dt = (now - lastTick) * 0.001f;
+    lastTick = now;
+    
+    left.sampleEncoder();
+    right.sampleEncoder();
+    left.update(dt);
+    right.update(dt);
+    odom.integrate(left.dsMM, right.dsMM, dt);
+  }
+
+  if (now - lastPrint >= 200) {
+    lastPrint = now;
+    Serial.print("L_ds:"); Serial.print(left.dsMM, 4);
+    Serial.print(" R_ds:"); Serial.print(right.dsMM, 4);
+    Serial.print(" L_pwm:"); Serial.print(left.lastPwm);
+    Serial.print(" R_pwm:"); Serial.print(right.lastPwm);
+    Serial.print(" L_spd:"); Serial.print(left.speedFilt, 4);
+    Serial.print(" R_spd:"); Serial.print(right.speedFilt, 4);
+    Serial.print(" odom_x:"); Serial.print(odom.x, 4);
+    Serial.print(" odom_th:"); Serial.println(odom.th, 4);
+  }
+}
+
+// ─────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────
 void setup() {
@@ -601,71 +641,74 @@ void setup() {
 //  Loop
 // ─────────────────────────────────────────────
 void loop() {
-  static uint32_t lastTick      = millis();
-  static uint32_t lastAgentPing = millis();
+  #ifdef TEST_MODE
+    testLoop();
+  #else
+    static uint32_t lastTick      = millis();
+    static uint32_t lastAgentPing = millis();
 
-  uint32_t now = millis();
+    uint32_t now = millis();
 
-  // ── micro-ROS agent state machine ──
-  // Try to connect every 500ms while waiting
-  // Detect disconnection and reconnect gracefully
-  if (now - lastAgentPing >= 500) {
-    lastAgentPing = now;
+    // ── micro-ROS agent state machine ──
+    // Try to connect every 500ms while waiting
+    // Detect disconnection and reconnect gracefully
+    if (now - lastAgentPing >= 500) {
+      lastAgentPing = now;
 
-    switch (agentState) {
-      case AgentState::WAITING:
-        if (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) {
-          if (microRosInit()) {
-            agentState = AgentState::CONNECTED;
-            Serial.println("[micro-ROS] Agent connected.");
-          } else {
-            agentState = AgentState::ERROR;
+      switch (agentState) {
+        case AgentState::WAITING:
+          if (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) {
+            if (microRosInit()) {
+              agentState = AgentState::CONNECTED;
+              Serial.println("[micro-ROS] Agent connected.");
+            } else {
+              agentState = AgentState::ERROR;
+            }
           }
-        }
-        break;
+          break;
 
-      case AgentState::CONNECTED:
-        if (RMW_RET_OK != rmw_uros_ping_agent(100, 1)) {
+        case AgentState::CONNECTED:
+          if (RMW_RET_OK != rmw_uros_ping_agent(100, 1)) {
+            microRosCleanup();
+            agentState = AgentState::WAITING;
+            left.stop(); right.stop();
+            Serial.println("[micro-ROS] Agent disconnected. Waiting...");
+          }
+          else {
+            //Periodically sync clock with agent:
+            static uint32_t lastSync = 0;
+            if (now - lastSync >= 30000) {
+              lastSync = now;
+              rmw_uros_sync_session(1000);
+            }
+          }
+          break;
+
+        case AgentState::ERROR:
           microRosCleanup();
           agentState = AgentState::WAITING;
-          left.stop(); right.stop();
-          Serial.println("[micro-ROS] Agent disconnected. Waiting...");
-        }
-        else {
-          //Periodically sync clock with agent:
-          static uint32_t lastSync = 0;
-          if (now - lastSync >= 30000) {
-            lastSync = now;
-            rmw_uros_sync_session(1000);
-          }
-        }
-        break;
-
-      case AgentState::ERROR:
-        microRosCleanup();
-        agentState = AgentState::WAITING;
-        break;
+          break;
+      }
     }
+
+    // ── Control tick ──
+    if (now - lastTick >= CTRL_PERIOD_MS) {
+      float dt = (now - lastTick) * 0.001f;
+      lastTick = now;
+
+      handleSerial();
+
+      left.sampleEncoder();
+      right.sampleEncoder();
+      left.update(dt);
+      right.update(dt);
+      odom.integrate(left.dsMM, right.dsMM, dt);
+
+      if (agentState == AgentState::CONNECTED) {
+        publishOdom();
+        rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+      }
   }
-
-  // ── Control tick ──
-  if (now - lastTick >= CTRL_PERIOD_MS) {
-    float dt = (now - lastTick) * 0.001f;
-    lastTick = now;
-
-    handleSerial();
-
-    left.sampleEncoder();
-    right.sampleEncoder();
-    left.update(dt);
-    right.update(dt);
-    odom.integrate(left.dsMM, right.dsMM, dt);
-
-    if (agentState == AgentState::CONNECTED) {
-      publishOdom();
-      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
-    }
-  }
-
+  #endif
   
 }
