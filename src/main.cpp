@@ -328,9 +328,6 @@ rclc_parameter_server_t param_server;
 nav_msgs__msg__Odometry        odom_msg;
 geometry_msgs__msg__Twist      cmd_vel_msg;
 
-// Timestamp helpers
-rcl_clock_t ros_clock;
-
 // ─────────────────────────────────────────────
 //  micro-ROS callbacks
 // ─────────────────────────────────────────────
@@ -437,8 +434,8 @@ bool microRosInit() {
   RCCHECK(rclc_parameter_set_double(&param_server, "pwm_slew",    gPwmSlew));
   RCCHECK(rclc_parameter_set_double(&param_server, "speed_alpha", gSpeedAlpha));
 
-  // Clock for odom timestamps
-  RCCHECK(rcl_clock_init(RCL_STEADY_TIME, &ros_clock, &allocator));
+  // Sync Pico clock with ROS agent wall time
+  rmw_uros_sync_session(1000);
 
   return true;
 }
@@ -450,15 +447,13 @@ void microRosCleanup() {
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
-  rcl_clock_fini(&ros_clock);
 }
 
 void publishOdom() {
-  // Timestamp
-  rcl_time_point_value_t now;
-  rcl_clock_get_now(&ros_clock, &now);
-  odom_msg.header.stamp.sec     = (int32_t)(now / 1000000000ULL);
-  odom_msg.header.stamp.nanosec = (uint32_t)(now % 1000000000ULL);
+  // Timestamp from agent epoch (correct wall clock time)
+  int64_t time_ns = rmw_uros_epoch_nanos();
+  odom_msg.header.stamp.sec     = (int32_t)(time_ns / 1000000000LL);
+  odom_msg.header.stamp.nanosec = (uint32_t)(time_ns % 1000000000LL);
 
   // Frame IDs — set once in setup, no need to repeat
   odom_msg.pose.pose.position.x = odom.x;
@@ -474,6 +469,15 @@ void publishOdom() {
   odom_msg.twist.twist.linear.x  = odom.vx;
   odom_msg.twist.twist.linear.y  = 0.0;
   odom_msg.twist.twist.angular.z = odom.wz;
+
+  // Pose covariance — diagonal, units metres^2 and radians^2
+  odom_msg.pose.covariance[0]  = 0.01;  // x
+  odom_msg.pose.covariance[7]  = 0.01;  // y
+  odom_msg.pose.covariance[35] = 0.05;  // yaw
+
+  // Twist covariance
+  odom_msg.twist.covariance[0]  = 0.01;  // vx
+  odom_msg.twist.covariance[35] = 0.05;  // vyaw
 
   rcl_publish(&odom_pub, &odom_msg, NULL);
 }
@@ -626,6 +630,14 @@ void loop() {
           agentState = AgentState::WAITING;
           left.stop(); right.stop();
           Serial.println("[micro-ROS] Agent disconnected. Waiting...");
+        }
+        else {
+          //Periodically sync clock with agent:
+          static uint32_t lastSync = 0;
+          if (now - lastSync >= 30000) {
+            lastSync = now;
+            rmw_uros_sync_session(1000);
+          }
         }
         break;
 
