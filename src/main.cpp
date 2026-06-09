@@ -95,9 +95,9 @@ struct SavedParams {
 float gKP         = 5.0f;
 float gKI         = 1.5f;
 float gKD         = 0.0f;
-float gPwmMax     = 255.0f;
+float gPwmMax     = 200.0f;
 float gPwmMin     = 30.0f;
-float gPwmSlew    = 15.0f;
+float gPwmSlew    = 30.0f;
 float gSpeedAlpha = 0.7f;
 
 float gTarget_mm_s = 0.0f;
